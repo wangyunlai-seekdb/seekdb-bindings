@@ -1,4 +1,4 @@
-name: SeekDB stack runtime probe retries
+name: SeekDB stack runtime probe on iOS and Android arm64
 on:
   push:
     branches: [codex/seekdb-stack-runtime-20261126]
@@ -15,15 +15,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: Windows x64
-            os: windows-2025
-            mode: windows
           - platform: Android ARM64 Bionic via QEMU
             os: ubuntu-24.04
             mode: bionic
-          - platform: Android x64 emulator
-            os: ubuntu-24.04
-            mode: android
+          - platform: iOS arm64 simulator
+            os: macos-26
+            mode: ios
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
@@ -43,18 +40,20 @@ jobs:
           git -C source update-ref refs/heads/main FETCH_HEAD
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
           python prepare.py source generated
-      - name: Run the Win64 probe using Clang and MSVC
-        if: matrix.mode == 'windows'
-        shell: cmd
+      - name: Run iOS Simulator worker probe
+        if: matrix.mode == 'ios'
         run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_INSTALL=%%i"
-          if not defined VS_INSTALL exit /b 1
-          call "%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          clang-cl --version || exit /b 1
-          clang-cl /nologo /O2 /EHsc /std:c++17 /clang:-fno-omit-frame-pointer /I. /Igenerated generated\bounds.cpp generated\jump.cpp generated\allocator.cpp probe.cpp touch.cpp /Fe:probe.exe || exit /b 1
-          probe.exe
+          xcodebuild -version
+          sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          bash compile.sh probe-ios "$(xcrun --sdk iphonesimulator --find clang++)" -target arm64-apple-ios18.0-simulator -isysroot "$sdk"
+          codesign --force --sign - probe-ios
+          device=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for r,xs in sorted(d.items(), reverse=True) if ".iOS-" in r for x in xs if "iPhone" in x["name"]))')
+          xcrun simctl boot "$device"
+          xcrun simctl bootstatus "$device" -b
+          xcrun simctl spawn "$device" "$PWD/probe-ios" | tee simulator.txt
+          grep '^PASS ' simulator.txt
       - name: Locate Android NDK
-        if: matrix.mode == 'bionic' || matrix.mode == 'android'
+        if: matrix.mode == 'bionic'
         run: |
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           ndk="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
@@ -65,29 +64,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user
-          bash compile.sh probe-bionic "$NDK_LLVM/aarch64-linux-android26-clang++" -static -pthread
+          bash compile.sh probe-bionic "$NDK_LLVM/aarch64-linux-android26-clang++" -static -pthread -Wl,-u,seekdb_probe_tls_alignment
           file probe-bionic
           readelf -lW probe-bionic | grep TLS
           ulimit -c 0
           qemu-aarch64 ./probe-bionic
-      - name: Run Android emulator worker probe
-        if: matrix.mode == 'android'
-        run: |
-          sudo setfacl -m u:"$USER":rw /dev/kvm
-          tools="$ANDROID_HOME/cmdline-tools/latest/bin"
-          image='system-images;android-35;aosp_atd;x86_64'
-          "$tools/sdkmanager" --install emulator platform-tools "$image"
-          printf 'no\n' | "$tools/avdmanager" create avd -f -n seekdb-probe -k "$image"
-          emulator_log="$RUNNER_TEMP/emulator.log"
-          trap 'tail -60 "$emulator_log" 2>/dev/null || true' ERR
-          "$ANDROID_HOME/emulator/emulator" -accel-check
-          "$ANDROID_HOME/emulator/emulator" -avd seekdb-probe -port 5556 -no-window -noaudio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -accel on > "$emulator_log" 2>&1 &
-          adb="$ANDROID_HOME/platform-tools/adb"
-          export ANDROID_SERIAL=emulator-5556
-          timeout 120 "$adb" wait-for-device
-          timeout 200 bash -c 'until [ "$("$1" shell getprop sys.boot_completed | tr -d "\r")" = 1 ]; do sleep 3; done' _ "$adb"
-          "$adb" shell getprop ro.product.cpu.abi
-          bash compile.sh probe-android "$NDK_LLVM/x86_64-linux-android26-clang++" -pthread -static-libstdc++
-          "$adb" push probe-android /data/local/tmp/seekdb-stack-probe
-          "$adb" shell chmod +x /data/local/tmp/seekdb-stack-probe
-          "$adb" shell /data/local/tmp/seekdb-stack-probe
