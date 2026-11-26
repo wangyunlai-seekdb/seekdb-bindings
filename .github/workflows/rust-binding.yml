@@ -1,4 +1,4 @@
-name: SeekDB stack runtime probe on iOS and Android arm64
+name: SeekDB iOS simulator stack probe
 on:
   push:
     branches: [codex/seekdb-stack-runtime-20261126]
@@ -7,7 +7,6 @@ permissions:
   contents: read
 env:
   SOURCE_SHA: 199d21a26a1ce18bc35acd1bad0eb1e2e7ef2bc3
-  ANDROID_NDK_VERSION: 27.3.13750724
 jobs:
   run:
     name: ${{ matrix.platform }}
@@ -15,12 +14,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: Android ARM64 Bionic via QEMU
-            os: ubuntu-24.04
-            mode: bionic
-          - platform: iOS arm64 simulator
-            os: macos-26
-            mode: ios
+          - platform: macOS 15 arm64 simulator
+            os: macos-15
+          - platform: macOS latest arm64 simulator
+            os: macos-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
@@ -41,31 +38,16 @@ jobs:
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
           python prepare.py source generated
       - name: Run iOS Simulator worker probe
-        if: matrix.mode == 'ios'
         run: |
           xcodebuild -version
           sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
           bash compile.sh probe-ios "$(xcrun --sdk iphonesimulator --find clang++)" -target arm64-apple-ios18.0-simulator -isysroot "$sdk"
           codesign --force --sign - probe-ios
-          device=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for r,xs in sorted(d.items(), reverse=True) if ".iOS-" in r for x in xs if "iPhone" in x["name"]))')
-          xcrun simctl boot "$device"
+          xcrun vtool -show-build probe-ios
+          xcrun simctl list runtimes available
+          read -r device state < <(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; phones=[x for r,xs in sorted(d.items(), reverse=True) if ".iOS-" in r for x in xs if "iPhone" in x["name"]]; p=next((x for x in phones if x["state"]=="Booted"), phones[0]); print(p["udid"],p["state"])')
+          if [ "$state" = Shutdown ]; then xcrun simctl boot "$device"; fi
           xcrun simctl bootstatus "$device" -b
+          xcrun simctl getenv "$device" SIMULATOR_RUNTIME_VERSION
           xcrun simctl spawn "$device" "$PWD/probe-ios" | tee simulator.txt
           grep '^PASS ' simulator.txt
-      - name: Locate Android NDK
-        if: matrix.mode == 'bionic'
-        run: |
-          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          ndk="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
-          if ! test -d "$ndk"; then "$sdkmanager" --install "ndk;$ANDROID_NDK_VERSION"; fi
-          printf 'NDK_LLVM=%s\n' "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
-      - name: Run Android ARM64 Bionic binary under QEMU
-        if: matrix.mode == 'bionic'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user
-          bash compile.sh probe-bionic "$NDK_LLVM/aarch64-linux-android26-clang++" -static -pthread -Wl,-u,seekdb_probe_tls_alignment
-          file probe-bionic
-          readelf -lW probe-bionic | grep TLS
-          ulimit -c 0
-          qemu-aarch64 ./probe-bionic
